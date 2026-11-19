@@ -14,133 +14,361 @@ const paths={
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/>'};
 const icon=k=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[k]+'</svg>';
 document.querySelectorAll('[data-icon]').forEach(el=>el.innerHTML=icon(el.dataset.icon));
-let q={...BI.base}, hourly=false, page=0, current, model='', sequence=0;
-const {fmt,pct}=BI, fields={output:'good',quality:'rate',load:'load',down:'down',average:'avg'};
-const metricNames={output:'Выпуск продукции',quality:'Доля брака',load:'Загрузка оборудования',down:'Простои оборудования',average:'Средний выпуск за час'};
-const unit={output:'шт.',quality:'%',load:'%',down:'мин',average:'шт./ч'};
-function spark(points,color) {
-  if(points.length<2)return '';
-  const min=Math.min(...points),range=Math.max(...points)-min||1;
-  const d=points.map((v,i)=>(i?'L':'M')+(1+i*92/(points.length-1)).toFixed(1)+' '+(26-21*(v-min)/range).toFixed(1)).join(' ');
-  return '<svg class="sparkline" viewBox="0 0 94 30" aria-hidden="true" preserveAspectRatio="none"><path d="'+d+' L93 30H1Z" fill="'+color+'" opacity=".09"/><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>';
+
+const numberFormat = new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 1});
+const pageSize = 6;
+const metrics = {
+  output: {name: 'Выпуск продукции', key: 'good', unit: 'шт.', color: '#cc6937', bg: '#fbecdf'},
+  quality: {name: 'Доля брака', key: 'rate', unit: '%', color: '#a55b55', bg: '#f8e9e5'},
+  down: {name: 'Простои', key: 'down', unit: 'мин', color: '#9d772f', bg: '#f7efdc'},
+  load: {name: 'Загрузка станков', key: 'load', unit: '%', color: '#477863', bg: '#e6eee6'}
+};
+const tableTitles = {
+  plan_shortfalls: 'Смены с отставанием',
+  hourly_output: 'Динамика по часам',
+  machine_ranking: 'Рейтинг станков',
+  downtime_events: 'Журнал простоев',
+  defect_breakdown: 'Брак по причинам',
+  compare_week: 'Сравнение с прошлой неделей'
+};
+let report = null;
+let requestController = null;
+let config = null;
+let tablePage = 0;
+
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = String(text).replace(/[\u2013\u2014]/g, '-');
+  return node;
 }
-function renderKpis(a){
-  const v=a.summary,tr=BI.trend(a,false),has=v.capacity>0;
-  const items=[
-    ['output','Выпуск продукции',fmt(v.good),'шт.','План '+fmt(v.plan)+' шт.','#cc6937','#fbecdf'],
-    ['quality','Доля брака',fmt(v.rate||0,1),'%',fmt(v.bad)+' шт. брака','#a55b55','#f8e9e5'],
-    ['down','Простои',fmt(v.down),'мин',a.selected.filter(r=>r.down>0).length+' событий','#9d772f','#f7efdc'],
-    ['load','Загрузка станков',fmt(v.load||0,1),'%','По машино-часам','#477863','#e6eee6']];
-  $('kpis').innerHTML=items.map(([k,n,val,u,f,c,bg])=>`<button class="kpi" data-k="${k}" aria-label="Показать график: ${n}"><span class="kpi-head"><span class="tileicon" style="background:${bg};color:${c}">${icon(k)}</span>${n}</span><div class="k-value">${has?val:'-'}<small>${u}</small></div><div class="k-foot">${f}</div>${spark(tr.map(x=>x.v[fields[k]]),c)}</button>`).join('');
+
+function number(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? numberFormat.format(value) : '-';
 }
-function renderContext(){
-  const flags=[q.shift!=='Все'&&q.shift,q.machine!=='Все'&&q.machine,q.status!=='Все'&&('Заказ · '+q.status),q.defect!=='Все'&&('Брак · '+q.defect),q.lag&&'Отставание ≥ 10 %',q.top>0&&('Топ-'+q.top),q.compare==='week'&&'Сравнение с прошлой неделей',q.offset===1&&'Неделей ранее',q.view==='events'&&q.min>0&&('События > '+q.min+' мин')].filter(Boolean);
-  $('context').innerHTML=flags.map(f=>'<span>'+f+'</span>').join('')+(flags.length?'<button id="clearContext">Сбросить фильтры</button>':'');
-  if($('clearContext'))$('clearContext').onclick=()=>change({...BI.base},'Сброшены фильтры.');
-  $('line').value=q.line;
-  const count=$('count'), val=q.since||q.until?'date':String(q.count);
-  count.querySelectorAll('[data-custom]').forEach(el=>el.remove());
-  if(![...count.options].some(o=>o.value===val)){const o=new Option(val==='date'?'Выбранные даты':q.count+' смен',val);o.dataset.custom='1';count.add(o)}
-  count.value=val;
-}
-function renderChart(a){
-  const k=q.metric, field=fields[k], data=BI.trend(a,hourly), week=q.compare==='week';
-  const baseline=week?'Неделей ранее':k==='output'?'План':'', stops=hourly&&data.some(b=>b.v.down>0);
-  $('chartTitle').textContent=metricNames[k]; $('legend').innerHTML='<span><i class="swatch"></i>'+ (k==='output'?'Факт':metricNames[k])+'</span>'+(baseline?'<span><i class="swatch dash"></i>'+baseline+'</span>':'')+(stops?'<span><i class="swatch dot"></i>Простой</span>':'');
-  $('shiftChart').setAttribute('aria-pressed',String(!hourly));$('hourChart').setAttribute('aria-pressed',String(hourly));
-  if(!data.length){$('chart').innerHTML='<div class="empty">Нет точек для выбранной выборки</div>';$('chartNote').textContent='Измените период или фильтры.';return}
-  const width=Math.max(315,$('chart').clientWidth-28),H=215,L=49,R=width-21,T=24,B=167;
-  const series=data.map(b=>b.v[field]),comparison=data.map(b=>week?(b.prev?.[field]??null):k==='output'?b.v.plan:null);
-  const lo=Math.max(1,...series,...comparison.filter(n=>n!=null)),order=10**Math.floor(Math.log10(lo)),step=Math.ceil(lo/4/(order/5))*(order/5),high=step*4;
-  const X=i=>data.length===1?(L+R)/2:L+(R-L)*i/(data.length-1),Y=v=>B-v/high*(B-T);
-  const coord=(i,v)=>X(i).toFixed(1)+','+Y(v).toFixed(1), line=series.map((v,i)=>(i?'L':'M')+coord(i,v)).join(' ');
-  let s='<defs><linearGradient id="fill" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#ed9a69" stop-opacity=".38"/><stop offset="1" stop-color="#f7cdb0" stop-opacity=".10"/></linearGradient></defs>';
-  for(let j=0;j<=4;j++){const v=high*j/4,y=Y(v);s+=`<path d="M${L} ${y}H${R}" stroke="#e1e6de" stroke-dasharray="3 4"/><text x="${L-8}" y="${y+4}" text-anchor="end">${fmt(v,v<10&&v%1?1:0)}</text>`}
-  s+=`<text x="${L-8}" y="13" text-anchor="end">${unit[k]}</text><path d="${line}L${X(series.length-1)},${B}L${X(0)},${B}Z" fill="url(#fill)"/>`;
-  if(baseline){
-    const reference=comparison.map((v,i)=>v==null?'':(i&&comparison[i-1]!=null?'L':'M')+coord(i,v)).join(' ');
-    if(!week&&hourly&&data.length>1){const band=comparison.map((v,i)=>(i?'L':'M')+coord(i,v)).join(' ')+comparison.map((_,i)=>{const j=comparison.length-i-1;return 'L'+coord(j,comparison[j]*.9)}).join(' ')+'Z';s+='<path d="'+band+'" fill="#7f96b0" opacity=".14"/>'}
-    s+='<path d="'+reference+'" fill="none" stroke="#7f8fa6" stroke-width="2" stroke-dasharray="6 5"/>';
+
+function addMessage(who, text, tips = []) {
+  const article = element('article', 'msg ' + who);
+  const meta = element('div', 'msg-meta');
+  const symbol = element('span', who === 'user' ? 'person-icon' : 'boticon');
+  symbol.innerHTML = icon(who === 'user' ? 'user' : 'spark');
+  if (who === 'user') meta.append('Вы ', symbol);
+  else meta.append(symbol, ' Такт');
+  article.append(meta, element('div', 'msg-text', text));
+  if (tips.length) {
+    const note = element('div', 'takeaway');
+    note.append(element('strong', '', tips.length === 1 ? 'Рекомендация' : 'Рекомендации'));
+    for (const tip of tips) note.append(element('p', '', tip));
+    article.append(note);
   }
-  s+='<path d="'+line+'" fill="none" stroke="#d7672f" stroke-width="2.8" stroke-linejoin="round"/>';
-  const stride=Math.max(1,Math.ceil((data.length-1)/Math.max(2,Math.floor((R-L)/95))));
-  data.forEach((b,i)=>{
-    const x=X(i),y=Y(series[i]),caption=hourly?BI.date(b.r.t)+' '+BI.clock(b.r.t):BI.label(b.r.s);
-    const digits=['quality','load','average'].includes(k)?1:0;
-    const diff=i>0&&data[i-1].r.t+BI.hour===b.r.t?series[i]-series[i-1]:null;
-    const tooltip=caption+' · '+metricNames[k]+' '+fmt(series[i],digits)+' '+unit[k]+(comparison[i]!=null?' · '+baseline+' '+fmt(comparison[i],digits)+' '+unit[k]:'')+(hourly&&diff!=null?' · К прошлому часу '+(diff>0?'+':'')+fmt(diff,digits)+' '+(unit[k]==='%'?'п.п.':unit[k]):'')+(b.v.down?' · Простой '+b.v.down+' маш.-мин':'');
-    if(data.length<=20)s+=`<circle cx="${x}" cy="${y}" r="${b.v.dev<=-10&&k==='output'?5:3.5}" stroke="#fff" stroke-width="1.8" fill="${b.v.dev<=-10&&k==='output'?'#ab4926':'#d7672f'}"/>`;
-    if(stops&&b.v.down){s+=`<path d="M${x},${B-7}l3.5,3.5 -3.5,3.5 -3.5,-3.5Z" fill="#aa4834"/>`}
-    s+=`<rect x="${x-Math.max(1,Math.min(14,(R-L)/data.length/2))}" y="${T}" width="${Math.max(2,Math.min(28,(R-L)/data.length))}" height="${B-T}" fill="transparent"><title>${tooltip}</title></rect>`;
-    if(i===0||i===data.length-1||i%stride===0&&data.length-1-i>=stride*.65){
-      const anchor=i===0?'start':i===data.length-1?'end':'middle';
-      s+=`<text x="${x}" y="${B+18}" text-anchor="${anchor}">${hourly?BI.clock(b.r.t):BI.date(b.r.t)}</text><text x="${x}" y="${B+35}" text-anchor="${anchor}">${hourly?BI.date(b.r.t):b.r.shift}</text>`;
-    }
+  const log = $('conversation');
+  log.append(article);
+  log.scrollTop = log.scrollHeight;
+}
+
+function renderKpis() {
+  const kpis = report.kpis;
+  const notes = {
+    output: 'План ' + number(kpis.plan) + ' шт.',
+    quality: number(kpis.bad) + ' шт. брака',
+    down: 'Суммарно по станкам',
+    load: 'По машино-часам'
+  };
+  const cards = Object.entries(metrics).map(([key, metric]) => {
+    const button = element('button', 'kpi');
+    button.dataset.k = key;
+    button.setAttribute('aria-label', 'Показать показатель «' + metric.name + '»');
+    const head = element('span', 'kpi-head');
+    const glyph = element('span', 'tileicon');
+    glyph.style.color = metric.color;
+    glyph.style.background = metric.bg;
+    glyph.innerHTML = icon(key);
+    head.append(glyph, metric.name);
+    const value = element('div', 'k-value', number(kpis[metric.key]));
+    value.append(element('small', '', metric.unit));
+    button.append(head, value, element('div', 'k-foot', notes[key]));
+    return button;
   });
-  $('chart').innerHTML=`<svg viewBox="0 0 ${width} ${H}" preserveAspectRatio="none" role="img" aria-label="${metricNames[k]} ${hourly?'по часам':'по сменам'}">${s}</svg>`;
-  const v=a.summary;
-  $('chartNote').textContent=week?'Сопоставлены те же смены и станки со сдвигом на семь дней.':hourly&&k==='output'?'Зона плана соответствует 90-100 % часового задания. Ромбы отмечают часы с простоем.':k==='output'?'Выполнение плана за период - '+pct(v.plan?100*v.good/v.plan:null)+'.':k==='down'?'Длительность суммируется по станкам, в машино-минутах.':k==='quality'?'Доля брака рассчитана от общего числа изготовленных деталей.':k==='average'?'Выпуск разделён на количество представленных часов.':'Загрузка рассчитана по доступному времени оборудования.';
+  $('kpis').replaceChildren(...cards);
 }
-function renderTable(a){
-  const events=a.events,items=events?a.incidents:a.groups, week=q.compare==='week',field=fields[q.metric];
-  const title=events?'Журнал простоев':q.view==='machine'?'Показатели по станкам':q.view==='line'?'Показатели по линиям':'Показатели по сменам';
-  $('tableTitle').textContent=title;$('rowCount').textContent=items.length+' строк';
-  const headers=events?['Начало','Конец','Линия','Станок','Мин','Причина']: [(q.view==='machine'?'Станок':q.view==='line'?'Линия':'Смена'),...(q.view==='line'?[]:['Линия']),'Выпуск','План','Откл.','Брак, %','Простой, мин',...(q.metric==='load'?['Загрузка, %']:[]),...(week?['Нед. ранее, '+unit[q.metric]]:[])];
-  if(!events&&q.metric==='average')headers.splice(week?-1:headers.length,0,'Среднее, шт./ч');
-  const cells=items.slice(page*6,page*6+6).map(g=>{
-    if(events)return [BI.date(g.begin)+' '+BI.clock(g.begin),BI.clock(g.end),g.line,g.machine,g.down,g.reason];
-    const {r,v}=g,dev=v.dev;return [q.view==='machine'?r.machine:q.view==='line'?'Линия '+r.line:BI.label(r.s),...(q.view==='line'?[]:[r.line]),fmt(v.good),fmt(v.plan),'<span class="'+(dev<=-10?'bad':dev>=0?'ok':'')+'">'+(dev>0?'+':'')+pct(dev)+'</span>',fmt(v.rate,1),fmt(v.down),...(q.metric==='load'?[fmt(v.load,1)]:[]),...(q.metric==='average'?[fmt(v.avg,1)]:[]),...(week?[g.prev?fmt(g.prev[field],['rate','load','avg'].includes(field)?1:0):'-']:[])];
+
+function displayFilters() {
+  const f = report.filters;
+  $('line').value = f.line;
+  const count = $('count');
+  const dates = f.since || f.until;
+  const selected = dates ? 'dates' : String(f.count);
+  count.querySelectorAll('[data-custom]').forEach(option => option.remove());
+  if (![...count.options].some(option => option.value === selected)) {
+    const opt = new Option(dates ? 'Выбранные даты' : f.count + ' смен', selected);
+    opt.dataset.custom = 'true';
+    count.add(opt);
+  }
+  count.value = selected;
+  const period = dates
+    ? [f.since || 'Начало витрины', f.until || 'Конец витрины'].join(' - ')
+    : 'Завершённые смены: ' + f.count;
+  $('period').textContent = period + ' · ' + (f.line === 'Все' ? 'Линии А и Б' : 'Линия ' + f.line);
+  const flags = [
+    f.shift !== 'Все' && f.shift,
+    f.machine !== 'Все' && f.machine,
+    f.status !== 'Все' && 'Заказ · ' + f.status,
+    f.defect !== 'Все' && 'Дефект · ' + f.defect,
+    f.lag && 'Отставание ≥ ' + number(f.threshold) + ' %',
+    f.top > 0 && 'Топ-' + f.top,
+    f.compare === 'week' && 'Сравнение с прошлой неделей',
+    f.offset > 0 && 'Неделей ранее',
+    f.tool === 'downtime_events' && f.min > 0 && 'Простой > ' + f.min + ' мин'
+  ].filter(Boolean);
+  const context = $('context');
+  context.replaceChildren(...flags.map(flag => element('span', '', flag)));
+  if (flags.length) {
+    const clear = element('button', '', 'Сбросить фильтры');
+    clear.onclick = () => requestReport('shift_summary', {}, 'Сбросить фильтры', {});
+    context.append(clear);
+  }
+  const section = f.tool === 'downtime_events' || f.view === 'events'
+    ? 'events' : f.view === 'machine' || f.tool === 'machine_ranking' ? 'machine' : 'shift';
+  document.querySelectorAll('[data-nav]').forEach(button => {
+    const active = button.dataset.nav === section;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
   });
-  $('table').innerHTML='<thead><tr>'+headers.map(h=>'<th scope="col">'+h+'</th>').join('')+'</tr></thead><tbody>'+(cells.length?cells.map(c=>'<tr>'+c.map(x=>'<td>'+x+'</td>').join('')+'</tr>').join(''):'<tr><td class="empty" colspan="'+headers.length+'">Нет подходящих записей</td></tr>')+'</tbody>';
-  $('pager').innerHTML=items.length>6?`<span>${page*6+1}-${Math.min(page*6+6,items.length)} из ${items.length}</span><div><button id="back" ${page===0?'disabled':''}>Назад</button> <button id="next" ${(page+1)*6>=items.length?'disabled':''}>Далее</button></div>`:'';
-  if($('back')){$('back').onclick=()=>{page--;renderTable(a)};$('next').onclick=()=>{page++;renderTable(a)}}
+  $('pageTitle').textContent = {shift:'Производственная сводка', machine:'Анализ оборудования', events:'Анализ простоев'}[section];
 }
-function render(){
-  page=0;current=BI.analyze(q);renderContext();renderKpis(current);renderChart(current);renderTable(current);
-  const nav=q.view==='line'?'shift':q.view;document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('active',b.dataset.nav===nav));
-  $('pageTitle').textContent=nav==='events'?'Анализ простоев':nav==='machine'?'Анализ оборудования':'Производственная сводка';
-  const rs=BI.select(q);
-  $('period').textContent=rs.length?BI.date(rs[0].t)+' '+BI.clock(rs[0].t)+' - '+BI.date(rs.at(-1).t+BI.hour)+' '+BI.clock(rs.at(-1).t+BI.hour)+' 2026 · '+(q.line==='Все'?'Линии А и Б':'Линия '+q.line):'Нет смен за выбранный период';
+
+function renderChart() {
+  const f = report.filters;
+  const byHour = f.grain === 'hour';
+  const granularity = byHour ? 'по часам' : 'по сменам';
+  $('chartTitle').textContent = report.metric_label;
+  $('shiftChart').setAttribute('aria-pressed', String(!byHour));
+  $('hourChart').setAttribute('aria-pressed', String(byHour));
+  const chart = $('chart');
+  if (!report.series.length) {
+    chart.replaceChildren(element('div', 'empty', 'Нет точек для выбранной выборки'));
+  } else {
+    const image = element('img', 'report-plot');
+    image.alt = report.chart.alt || report.metric_label + ' ' + granularity;
+    image.src = 'data:image/png;base64,' + report.chart.data;
+    chart.replaceChildren(image);
+  }
+  $('chartNote').textContent = f.compare === 'week'
+    ? 'Сравнение с теми же часами и оборудованием семь суток назад.'
+    : report.metric_label + ' ' + granularity + ', ' + report.unit + '.';
 }
-function message(who,body,tip=''){
-  const el=document.createElement('article');el.className='msg '+who;
-  el.innerHTML='<div class="msg-meta">'+(who==='user'?'Вы <span class="person-icon">'+icon('user')+'</span>':'<span class="boticon">'+icon('spark')+'</span> Такт')+'</div><div class="msg-text"></div>';
-  el.lastChild.textContent=body;
-  if(tip){const block=document.createElement('div');block.className='takeaway';const title=document.createElement('strong');title.textContent='Рекомендация';block.append(title,document.createTextNode(tip));el.append(block)}
-  $('conversation').append(el);$('conversation').scrollTop=$('conversation').scrollHeight;
-}
-function answer(){const result=BI.report(current);message('bot',result.text,result.tip)}
-function change(next,user){sequence++;$('send').disabled=false;q=next;render();message('user',user);answer()}
-function init(){++sequence;modelLabel();$('send').disabled=false;q={...BI.base};hourly=false;$('conversation').replaceChildren();$('question').value='';render();message('user','Как цех выполнил план за последние 5 смен?');answer()}
-function modelLabel(){ $('mode').textContent=model?'LLM · '+model:'Демонстрационный режим' }
-async function ask(text){
-  const t=text.trim().replace(/[\u2013\u2014]/g,'-');if(!t||$('send').disabled)return;
-  $('question').value='';message('user',t);const id=++sequence;$('send').disabled=true;
-  let next,h=hourly;
-  try{
-    if(model){
-      $('mode').textContent='Разбираю вопрос…';
-      const res=await fetch('/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:t,context:{...q,hourly}})});
-      const data=await res.json();if(!res.ok)throw Error(data.error||'Ошибка сервиса Ollama.');
-      if(!data.supported)throw Error('Уточните период, показатель или оборудование. Модель не смогла сопоставить запрос с витриной.');
-      const {supported,hourly:byHour,...plan}=data;h=byHour;next=plan;
-    }else{
-      next=BI.parse(t,q);if(/по часам|почасов/i.test(t))h=true;else if(/по сменам|между сменами|сброс|сначала/i.test(t))h=false;
+
+function renderTable() {
+  const {rows, columns} = report.table;
+  const f = report.filters;
+  $('tableTitle').textContent = tableTitles[f.tool] || ({machine:'Показатели по станкам', line:'Показатели по линиям', shift:'Показатели по сменам'})[f.view] || 'Результаты анализа';
+  $('rowCount').textContent = 'Строк: ' + rows.length;
+  const table = $('table');
+  table.replaceChildren();
+  const head = element('thead');
+  const header = element('tr');
+  head.append(header);
+  table.append(head);
+  for (const column of columns) {
+    const cell = element('th', '', column.label + (column.unit ? ', ' + column.unit : ''));
+    cell.scope = 'col';
+    header.append(cell);
+  }
+  const body = element('tbody');
+  table.append(body);
+  const start = tablePage * pageSize;
+  for (const row of rows.slice(start, start + pageSize)) {
+    const tr = element('tr');
+    body.append(tr);
+    for (const {key} of columns) {
+      const value = row[key];
+      const cell = element('td');
+      tr.append(cell);
+      const display = typeof value === 'number' ? number(value) : value ?? '-';
+      if (key === 'deviation' && typeof value === 'number') {
+        cell.append(element('span', value <= -10 ? 'bad' : value >= 0 ? 'ok' : '', display));
+      } else {
+        cell.textContent = display;
+      }
     }
-    if(sequence!==id)return;q=next;hourly=h;render();answer();
-  }catch(e){if(sequence===id)message('bot',e.message)}
-  finally{if(sequence===id){$('send').disabled=false;modelLabel()}}
+  }
+  if (!rows.length) {
+    const tr = element('tr');
+    const cell = element('td');
+    tr.append(cell);
+    body.append(tr);
+    cell.colSpan = Math.max(1, columns.length);
+    cell.className = 'empty';
+    cell.textContent = 'Нет подходящих записей';
+  }
+  const pager = $('pager');
+  pager.replaceChildren();
+  if (rows.length > pageSize) {
+    const end = Math.min(start + pageSize, rows.length);
+    const previous = element('button', '', 'Назад');
+    const next = element('button', '', 'Далее');
+    previous.disabled = tablePage === 0;
+    next.disabled = end === rows.length;
+    previous.onclick = () => { tablePage--; renderTable() };
+    next.onclick = () => { tablePage++; renderTable() };
+    const group = element('div');
+    group.append(previous, ' ', next);
+    pager.append(element('span', '', (start + 1) + '-' + end + ' из ' + rows.length), group);
+  }
+  $('exportJson').disabled = false;
 }
-$('ask').onsubmit=e=>{e.preventDefault();ask($('question').value)};
-$('question').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();ask($('question').value)}};
-document.querySelectorAll('[data-prompt]').forEach(b=>b.onclick=()=>ask(b.dataset.prompt));
-$('kpis').onclick=e=>{const k=e.target.closest('[data-k]')?.dataset.k;if(k)change({...q,metric:k,view:k==='down'?'events':q.view==='events'?'shift':q.view},'Показать показатель «'+metricNames[k]+'».')};
-document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{const view=b.dataset.nav;change({...q,view,metric:view==='events'?'down':'output',lag:false,top:0,min:0},'Открыть раздел «'+b.textContent+'».')});
-$('brand').onclick=e=>{e.preventDefault();init()};$('reset').onclick=init;
-$('line').onchange=e=>change({...q,line:e.target.value,machine:'Все'},e.target.selectedOptions[0].text);
-$('count').onchange=e=>change({...q,count:Number(e.target.value),since:'',until:'',offset:0},e.target.selectedOptions[0].text);
-$('shiftChart').onclick=()=>{hourly=false;renderChart(current)};$('hourChart').onclick=()=>{hourly=true;renderChart(current)};
-$('method').onclick=$('help').onclick=()=>$('about').showModal();$('close').onclick=()=>$('about').close();
-init();
-if(['localhost','127.0.0.1'].includes(location.hostname))fetch('/api/config').then(r=>r.json()).then(d=>{model=typeof d.model==='string'?d.model:'';modelLabel()}).catch(()=>{});
-new ResizeObserver(()=>renderChart(current)).observe($('chart'));
+
+function render() {
+  tablePage = 0;
+  displayFilters();
+  renderKpis();
+  renderChart();
+  renderTable();
+}
+
+function setBusy(busy) {
+  const selector = '[data-nav], [data-prompt], .kpi, #count, #line, #context button, .segments button, #send';
+  document.querySelectorAll(selector).forEach(button => { button.disabled = busy });
+  $('overview').setAttribute('aria-busy', String(busy));
+  const mode = config?.mode;
+  const name = report?.mode === 'llm' ? report.model : config?.model;
+  $('mode').textContent = busy ? 'Обрабатываю запрос…' : mode === 'llm'
+    ? 'LLM · ' + (name || 'Подключена') : mode === 'demo' ? 'Демонстрационный режим' : 'Нет подключения';
+}
+
+async function api(path, body, signal) {
+  let response;
+  try {
+    response = await fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? {'Content-Type':'application/json'} : {},
+      body: body ? JSON.stringify(body) : undefined,
+      signal
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    throw Error('Нет соединения с Python-сервером. Проверьте, что сервис запущен, и повторите запрос.');
+  }
+  const json = await response.json().catch(() => null);
+  if (!response.ok || !json || typeof json !== 'object') {
+    const detail = json?.error || json?.detail;
+    throw Error(typeof detail === 'string' ? detail : 'Сервер не вернул отчёт (HTTP ' + response.status + ').');
+  }
+  return json;
+}
+
+function validateReport(result) {
+  if (!result.filters || !result.kpis || !Array.isArray(result.table?.columns)
+      || !Array.isArray(result.table?.rows) || !Array.isArray(result.series)
+      || typeof result.summary !== 'string' || !Array.isArray(result.recommendations)) {
+    throw Error('Сервер вернул неполный отчёт.');
+  }
+  if (result.series.length && (result.chart?.mime_type !== 'image/png' || typeof result.chart.data !== 'string' || !result.chart.data)) {
+    throw Error('Сервер не вернул график Matplotlib.');
+  }
+}
+
+async function update(path, body, text, reset = false) {
+  requestController?.abort();
+  const controller = new AbortController();
+  requestController = controller;
+  if (reset) $('conversation').replaceChildren();
+  $('failure').hidden = true;
+  $('failure').textContent = '';
+  addMessage('user', text);
+  setBusy(true);
+  try {
+    if (!config) config = await api('/api/config', null, controller.signal);
+    const result = await api(path, body, controller.signal);
+    if (requestController !== controller) return;
+    validateReport(result);
+    report = result;
+    render();
+    addMessage('bot', report.summary, report.recommendations);
+  } catch (err) {
+    if (controller.signal.aborted || requestController !== controller) return;
+    if (report) displayFilters();
+    $('failure').textContent = err.message;
+    $('failure').hidden = false;
+    addMessage('bot', err.message);
+  } finally {
+    if (requestController === controller) {
+      requestController = null;
+      setBusy(false);
+    }
+  }
+}
+
+function requestReport(tool, args, text, context = report?.filters || {}) {
+  return update('/api/report', {tool, arguments:args, context}, text);
+}
+
+function resetReport() {
+  $('question').value = '';
+  return update('/api/report', {tool:'shift_summary', arguments:{}, context:{}},
+    'Как цех выполнил план за последние 5 смен?', true);
+}
+
+function ask(question) {
+  const text = question.trim().replace(/[\u2013\u2014]/g, '-');
+  if (!text || requestController) return;
+  $('question').value = '';
+  return update('/api/chat', {question:text, context:report?.filters || {}}, text);
+}
+
+function bindEvents() {
+  $('ask').onsubmit = event => { event.preventDefault(); ask($('question').value) };
+  $('question').onkeydown = event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      ask(event.target.value);
+    }
+  };
+  document.querySelectorAll('[data-prompt]').forEach(button => {
+    button.onclick = () => ask(button.dataset.prompt);
+  });
+  $('kpis').onclick = event => {
+    const key = event.target.closest('[data-k]')?.dataset.k;
+    if (!key || !report) return;
+    const f = report.filters;
+    const view = ['shift','line','machine'].includes(f.view) ? f.view : 'shift';
+    const tool = key === 'down' ? 'downtime_events' : key === 'load' ? 'equipment_load' : 'shift_summary';
+    requestReport(tool, {metric:key, view:key === 'down' ? 'events' : view, top:0, lag:false}, metrics[key].name);
+  };
+  document.querySelectorAll('[data-nav]').forEach(button => {
+    button.onclick = () => {
+      const view = button.dataset.nav;
+      const events = view === 'events';
+      requestReport(events ? 'downtime_events' : 'shift_summary',
+        {view, metric:events ? 'down' : 'output', lag:false, top:0, min:0}, button.textContent);
+    };
+  });
+  $('line').onchange = event => requestReport(report?.filters.tool || 'shift_summary',
+    {line:event.target.value, machine:'Все'}, event.target.selectedOptions[0].text);
+  $('count').onchange = event => requestReport(report?.filters.tool || 'shift_summary',
+    {count:Number(event.target.value), since:'', until:'', offset:0}, event.target.selectedOptions[0].text);
+  for (const [id, grain] of [['shiftChart','shift'],['hourChart','hour']]) {
+    $(id).onclick = () => requestReport(report?.filters.tool || 'shift_summary', {grain}, $(id).textContent);
+  }
+  $('exportJson').onclick = () => {
+    if (!report) return;
+    const file = new Blob([JSON.stringify(report.table, null, 2)], {type:'application/json;charset=utf-8'});
+    const href = URL.createObjectURL(file);
+    const link = element('a');
+    link.href = href;
+    link.download = 'takt-' + report.filters.tool + '.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(href), 1000);
+  };
+  $('reset').onclick = resetReport;
+  $('brand').onclick = event => { event.preventDefault(); resetReport() };
+  $('method').onclick = $('help').onclick = () => $('about').showModal();
+  $('close').onclick = () => $('about').close();
+}
+
+if (location.protocol === 'file:') {
+  location.replace('offline.html');
+} else {
+  bindEvents();
+  resetReport();
+}
