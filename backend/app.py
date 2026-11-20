@@ -1,4 +1,3 @@
-"""Такт HTTP API. Run with: python -m uvicorn app:app --port 8765."""
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,7 +7,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import analytics
@@ -16,9 +14,8 @@ import llm
 from charts import chart_for
 from demo import parse_question
 
-
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT.parent / ".env")
 Cell = str | int | float | bool | None
 
 
@@ -74,7 +71,7 @@ class Point(BaseModel):
 
 class Chart(BaseModel):
     mime_type: Literal["image/png"]
-    data: str = Field(description="Изображение Matplotlib, закодированное в base64")
+    data: str
     alt: str
 
 
@@ -102,7 +99,7 @@ def direct_report(db, tool, arguments, context, mode):
 
 
 def build_app(db_path=None):
-    db = Path(db_path or os.getenv("DATABASE_PATH", ROOT / "data" / "workshop.sqlite3"))
+    db = Path(db_path or os.getenv("DATABASE_PATH", ROOT.parent / "data" / "workshop.sqlite3"))
 
     @asynccontextmanager
     async def lifespan(app):
@@ -126,6 +123,10 @@ def build_app(db_path=None):
     @app.exception_handler(ValueError)
     async def invalid(request: Request, error: ValueError):
         return JSONResponse({"error": str(error)}, status_code=422)
+
+    @app.get("/")
+    def root():
+        return {"service": "takt-bi"}
 
     @app.get("/api/health")
     def health():
@@ -157,7 +158,6 @@ def build_app(db_path=None):
             report = direct_report(db, tool, arguments, context, "demo")
         return finish(report)
 
-    app.mount("/", StaticFiles(directory=ROOT / "dist", html=True), name="dashboard")
     return app
 
 

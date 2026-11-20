@@ -1,5 +1,3 @@
-"""Manufacturing data mart and named, read-only analytics tools."""
-
 import math
 import sqlite3
 from contextlib import closing
@@ -103,7 +101,6 @@ def _check_fields(fields, *, context):
 
 
 def validate_filters(context):
-    """Validate an incoming conversation context independently of the model."""
     context = {} if context is None else context
     _check_fields(context, context=True)
     q = DEFAULT_FILTERS | context
@@ -120,7 +117,6 @@ def _resolve(name, args, previous, defaults):
     _check_fields(args, context=False)
     q = validate_filters(previous)
     if name != "compare_week" and name != q["tool"]:
-        # Explicitly changing the task preserves scope (dates, machines, etc.).
         q.update({k: DEFAULT_FILTERS[k] for k in ("lag", "top", "min", "threshold", "view", "metric", "grain", "compare")})
     if name != q["tool"]:
         q.update(defaults)
@@ -150,7 +146,6 @@ def _resolve(name, args, previous, defaults):
 
 
 def _seed_rows():
-    # Same Park-Miller series and positive Math.round semantics as the demo.
     seed = 23041
 
     def draw():
@@ -183,7 +178,6 @@ def _seed_rows():
 
 
 def init_db(db_path):
-    """Initialize once, also when multiple worker processes start together."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(db_path, timeout=30)) as db, db:
         db.execute("BEGIN IMMEDIATE")
@@ -232,8 +226,6 @@ def _totals(defect, *, qualified="", down_threshold=None):
     prefix = qualified
     good, plan, bad, tick, down = (prefix + k for k in ("good", "plan", "bad", "tick", "down"))
     selected = prefix + DEFECTS.get(defect, "bad")
-    # down_threshold is an already validated integer. Filtering the downtime metric
-    # never removes the hours contributing to production, defects and capacity.
     down_term = down if down_threshold is None else f"CASE WHEN {down}>{down_threshold} THEN {down} ELSE 0 END"
     return f"""
         COALESCE(SUM({good}),0) AS good, COALESCE(SUM({plan}),0) AS plan,
@@ -264,8 +256,6 @@ def _restrict(db, q, dims, totals):
 
 
 def _previous(db, q):
-    # Current coordinates label each prior row, even across midnight. A LEFT
-    # JOIN retains missing prior observations for explicit completeness checks.
     predicate = "AND p.status = ?" if q["status"] != ALL else ""
     params = [q["status"]] if predicate else []
     db.execute(f"""CREATE TEMP TABLE historical AS
@@ -333,7 +323,6 @@ def _metrics_table(db, q, dims):
     if field in ("average", "load"):
         columns.append(col(field, label, unit))
     if "tick" in dims:
-        # Compare adjacent clock hours only. Gaps between night shifts have no delta.
         deltas = dict(db.execute(f"""WITH hourly AS (
             SELECT tick, {_totals(q["defect"])} FROM scope GROUP BY tick
         ), pairs AS (
@@ -414,7 +403,6 @@ def _facts(q, table, kpi, historical_kpi):
     first = rows[0]
     if q["compare"] == "week":
         field, label, unit = METRICS[q["metric"]]
-        # Report on the whole selected cohort; row-level comparisons are in the table.
         value = kpi[field]
         if basis == "downtime_events":
             value = sum(row["down"] for row in rows)
@@ -451,7 +439,6 @@ def _facts(q, table, kpi, historical_kpi):
 
 
 def _analyze(db_path, name, arguments, previous_filters, **defaults):
-    """Build an analysis in a single consistent SQLite read transaction."""
     q = _resolve(name, {} if arguments is None else arguments, previous_filters, defaults)
     basis = q["basis"]
     dims = GROUPS["hour" if basis == "hourly_output" else q["view"]]
@@ -483,43 +470,35 @@ def _analyze(db_path, name, arguments, previous_filters, **defaults):
 
 
 def shift_summary(db_path, arguments=None, previous_filters=None):
-    """Aggregate output, production plan, downtime and defects by the requested group."""
     return _analyze(db_path, "shift_summary", arguments, previous_filters)
 
 
 def plan_shortfalls(db_path, arguments=None, previous_filters=None):
-    """Select groups by weighted plan deviation, including each group's reject rate."""
     return _analyze(db_path, "plan_shortfalls", arguments, previous_filters, lag=True)
 
 
 def hourly_output(db_path, arguments=None, previous_filters=None):
-    """Calculate hourly metrics, event markers and change from an adjacent hour."""
     return _analyze(db_path, "hourly_output", arguments, previous_filters, grain="hour")
 
 
 def machine_ranking(db_path, arguments=None, previous_filters=None):
-    """Rank machines by a metric and use the selected machines for the whole report."""
     return _analyze(db_path, "machine_ranking", arguments, previous_filters,
                     view="machine", top=3, metric="quality")
 
 
 def compare_week(db_path, arguments=None, previous_filters=None):
-    """Pair the active cohort with the same machines and hours exactly a week earlier."""
     return _analyze(db_path, "compare_week", arguments, previous_filters, compare="week")
 
 
 def downtime_events(db_path, arguments=None, previous_filters=None):
-    """List incidents exceeding the duration threshold, with recorded causes."""
     return _analyze(db_path, "downtime_events", arguments, previous_filters, view="events", metric="down")
 
 
 def defect_breakdown(db_path, arguments=None, previous_filters=None):
-    """Count defects by reason, using all manufactured pieces as the denominator."""
     return _analyze(db_path, "defect_breakdown", arguments, previous_filters, metric="quality")
 
 
 def equipment_load(db_path, arguments=None, previous_filters=None):
-    """Compute runtime as a share of available machine-minutes."""
     return _analyze(db_path, "equipment_load", arguments, previous_filters, view="machine", metric="load")
 
 

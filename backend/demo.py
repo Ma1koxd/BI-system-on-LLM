@@ -1,4 +1,3 @@
-"""Offline Russian intent parsing for the no-key mode; uses the same SQL tools."""
 import re
 from datetime import date, timedelta
 

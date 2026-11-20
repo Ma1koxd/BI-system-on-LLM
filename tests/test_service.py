@@ -1,12 +1,15 @@
 import base64
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import analytics
 from app import build_app

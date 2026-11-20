@@ -1,5 +1,3 @@
-"""Function calling and structured reporting via OpenAI-compatible Chat Completions."""
-
 import json
 import os
 from urllib.parse import urlsplit
@@ -10,15 +8,15 @@ from analytics import TOOLS, execute_tool, validate_filters
 
 
 class ProviderError(RuntimeError):
-    """The configured provider failed to return a usable protocol response."""
+    pass
 
 
 class ProviderConfigurationError(ProviderError):
-    """The server lacks a usable provider configuration."""
+    pass
 
 
 class ChatClarification(ValueError):
-    """The question needs more information to resolve an analytics operation."""
+    pass
 
 
 def _settings():
@@ -45,7 +43,6 @@ def _settings():
 
 
 def get_config():
-    """Public status for the server; the API key stays in the request client."""
     base_url, model, key, _ = _settings()
     return {"base_url": base_url, "model": model, "configured": bool(key)}
 
@@ -170,7 +167,6 @@ def _analyze(client, db_path, question, context, model, router):
     facts = {f"F{i}": fact for i, fact in enumerate(report["facts"], 1)}
     tips = {"R1": report["recommendation"]}
     evidence = json.dumps({"facts": facts, "recommendations": tips}, ensure_ascii=False)
-    # Preserve provider-specific reasoning blocks required by some routed models.
     assistant = {
         "role": "assistant",
         "content": planned.content,
@@ -206,7 +202,6 @@ def _analyze(client, db_path, question, context, model, router):
 
 
 def run_chat(db_path, question, context=None, *, client=None):
-    """Plan one read-only analytics call, then select evidence with Structured Outputs."""
     if not isinstance(question, str) or not question.strip() or len(question) > 1500:
         raise ValueError("Введите вопрос длиной от 1 до 1500 символов.")
     filters = validate_filters({} if context is None else context)

@@ -1,6 +1,6 @@
-"""Exercise the real OpenAI SDK over loopback and the real analytics SQLite database."""
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from analytics import init_db
 from llm import ProviderError, run_chat

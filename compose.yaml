@@ -1,8 +1,6 @@
 services:
-  takt:
-    build: .
-    ports:
-      - "127.0.0.1:8765:8765"
+  backend:
+    build: ./backend
     environment:
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -10,9 +8,19 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      DATABASE_PATH: /app/data/workshop.sqlite3
+      DATABASE_PATH: /data/workshop.sqlite3
     volumes:
-      - workshop-data:/app/data
+      - workshop-data:/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   workshop-data:
