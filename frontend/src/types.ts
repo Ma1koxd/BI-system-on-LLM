@@ -64,11 +64,6 @@ export interface Report {
     rows: Record<string, Cell>[];
   };
   series: SeriesPoint[];
-  chart: {
-    mime_type: string;
-    data: string;
-    alt: string;
-  };
   facts: string[];
   summary: string;
   recommendations: string[];

@@ -1,9 +1,11 @@
 import math
-import sqlite3
-from contextlib import closing
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+from sqlalchemy import Column, Integer, String, Text, create_engine, func, Index, select
+from sqlalchemy.orm import DeclarativeBase, Session
 
 START = datetime(2026, 10, 29, 8)
 MACHINES = ("S-101", "S-102", "S-201", "S-202")
@@ -36,6 +38,133 @@ METRICS = {
     "down": ("down", "Простои", "мин"),
     "average": ("average", "Средний выпуск за час", "шт./ч"),
 }
+GROUPS = {"shift": ("shift_id", "line"), "line": ("line",), "machine": ("machine",),
+          "hour": ("tick",), "period_shift": ("shift_id",), "events": ("machine",)}
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Production(Base):
+    __tablename__ = "production"
+    tick = Column(Integer, primary_key=True)
+    machine = Column(String, primary_key=True)
+    shift_id = Column(Integer, nullable=False)
+    line = Column(String, nullable=False)
+    shift = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    plan = Column(Integer, nullable=False)
+    good = Column(Integer, nullable=False)
+    bad = Column(Integer, nullable=False)
+    size_bad = Column(Integer, nullable=False)
+    surface_bad = Column(Integer, nullable=False)
+    shape_bad = Column(Integer, nullable=False)
+    down = Column(Integer, nullable=False)
+    started_at = Column(Text)
+    ended_at = Column(Text)
+    reason = Column(Text)
+    __table_args__ = (Index("production_shift", "shift_id", "line", "machine"),)
+
+
+def engine_for(db_path):
+    return create_engine(f"sqlite:///{db_path}", future=True)
+
+
+def init_db(db_path):
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = engine_for(db_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        count = session.scalar(select(func.count()).select_from(Production))
+        if not count:
+            session.bulk_insert_mappings(Production, list(_seed_rows()))
+            session.commit()
+    engine.dispose()
+
+
+def _seed_rows():
+    seed = 23041
+
+    def draw():
+        nonlocal seed
+        seed = seed * 16807 % 2147483647
+        return seed / 2147483647
+
+    for s in range(SHIFT_COUNT):
+        for h in range(12):
+            tick = s * 12 + h
+            stamp = START + timedelta(hours=tick)
+            for m, machine in enumerate(MACHINES):
+                plan = 26 + m % 3 * 4 + s % 4
+                troubled = (s == 38 and m < 2) or (s == 40 and m >= 2)
+                down = math.floor(12 + draw() * 39) if draw() < (.23 if troubled else .033) else 0
+                if (s, m, h) == (38, 1, 6):
+                    down = 45
+                good = math.floor(.5 + plan * (1 - down / 60) * (.86 + draw() * .24) * (.82 if troubled else 1))
+                p_bad = .12 + draw() * .13 if troubled else .012 + draw() * .055
+                bad = math.floor(.5 + good * p_bad)
+                size = math.floor(.5 + bad * .5)
+                surface = math.floor((bad - size) * .65)
+                begin = stamp + timedelta(minutes=math.floor(draw() * (61 - down)))
+                yield {
+                    "tick": tick, "machine": machine, "shift_id": s, "line": LINES[m // 2],
+                    "shift": "Ночь" if s % 2 else "День",
+                    "status": "Активен" if (s + m) % 4 else "Завершён",
+                    "plan": plan, "good": good, "bad": bad, "size_bad": size,
+                    "surface_bad": surface, "shape_bad": bad - size - surface, "down": down,
+                    "started_at": begin.isoformat(" ", timespec="minutes") if down else None,
+                    "ended_at": (begin + timedelta(minutes=down)).isoformat(" ", timespec="minutes") if down else None,
+                    "reason": CAUSES[(s + h + m) % 3] if down else None,
+                }
+
+
+def _load_df(db_path):
+    engine = engine_for(db_path)
+    df = pd.read_sql_table("production", engine)
+    engine.dispose()
+    return df
+
+
+def _clean(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if np.isnan(value) else float(value)
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _check_fields(fields, *, context):
+    if not isinstance(fields, dict):
+        raise ValueError("Фильтры должны быть объектом JSON.")
+    for name, value in fields.items():
+        if context and name in ("tool", "basis"):
+            if not isinstance(value, str) or value not in TOOL_DESCRIPTIONS:
+                raise ValueError("Неизвестный аналитический инструмент.")
+            continue
+        spec = ARGUMENTS.get(name)
+        if spec is None:
+            raise ValueError(f"Неизвестный параметр {name!r}.")
+        if "enum" in spec:
+            valid = value in spec["enum"]
+        elif spec["type"] == "number":
+            valid = type(value) in (float, int) and spec["minimum"] <= value <= spec["maximum"]
+        elif spec["type"] == "integer":
+            valid = type(value) is int and spec["minimum"] <= value <= spec["maximum"]
+        elif spec["type"] == "boolean":
+            valid = isinstance(value, bool)
+        else:
+            valid = isinstance(value, str) and (value == "" or len(value) == 10)
+            if valid and value:
+                try:
+                    valid = date.fromisoformat(value).isoformat() == value
+                except ValueError:
+                    valid = False
+        if not valid:
+            raise ValueError(f"Недопустимое значение параметра {name!r}.")
 
 
 def enum(*values):
@@ -68,36 +197,6 @@ TOOLS = [
     }}
     for name, description in TOOL_DESCRIPTIONS.items()
 ]
-
-
-def _check_fields(fields, *, context):
-    if not isinstance(fields, dict):
-        raise ValueError("Фильтры должны быть объектом JSON.")
-    for name, value in fields.items():
-        if context and name in ("tool", "basis"):
-            if not isinstance(value, str) or value not in TOOL_DESCRIPTIONS:
-                raise ValueError("Неизвестный аналитический инструмент.")
-            continue
-        spec = ARGUMENTS.get(name)
-        if spec is None:
-            raise ValueError(f"Неизвестный параметр {name!r}.")
-        if "enum" in spec:
-            valid = value in spec["enum"]
-        elif spec["type"] == "number":
-            valid = type(value) in (float, int) and spec["minimum"] <= value <= spec["maximum"]
-        elif spec["type"] == "integer":
-            valid = type(value) is int and spec["minimum"] <= value <= spec["maximum"]
-        elif spec["type"] == "boolean":
-            valid = isinstance(value, bool)
-        else:
-            valid = isinstance(value, str) and (value == "" or len(value) == 10)
-            if valid and value:
-                try:
-                    valid = date.fromisoformat(value).isoformat() == value
-                except ValueError:
-                    valid = False
-        if not valid:
-            raise ValueError(f"Недопустимое значение параметра {name!r}.")
 
 
 def validate_filters(context):
@@ -145,158 +244,125 @@ def _resolve(name, args, previous, defaults):
     return validate_filters(q)
 
 
-def _seed_rows():
-    seed = 23041
-
-    def draw():
-        nonlocal seed
-        seed = seed * 16807 % 2147483647
-        return seed / 2147483647
-
-    for s in range(SHIFT_COUNT):
-        for h in range(12):
-            tick = s * 12 + h
-            stamp = START + timedelta(hours=tick)
-            for m, machine in enumerate(MACHINES):
-                plan = 26 + m % 3 * 4 + s % 4
-                troubled = (s == 38 and m < 2) or (s == 40 and m >= 2)
-                down = math.floor(12 + draw() * 39) if draw() < (.23 if troubled else .033) else 0
-                if (s, m, h) == (38, 1, 6):
-                    down = 45
-                good = math.floor(.5 + plan * (1 - down / 60) * (.86 + draw() * .24) * (.82 if troubled else 1))
-                p_bad = .12 + draw() * .13 if troubled else .012 + draw() * .055
-                bad = math.floor(.5 + good * p_bad)
-                size = math.floor(.5 + bad * .5)
-                surface = math.floor((bad - size) * .65)
-                begin = stamp + timedelta(minutes=math.floor(draw() * (61 - down)))
-                yield (tick, machine, s, LINES[m // 2], "Ночь" if s % 2 else "День",
-                       "Активен" if (s + m) % 4 else "Завершён", plan, good, bad,
-                       size, surface, bad - size - surface, down,
-                       begin.isoformat(" ", timespec="minutes") if down else None,
-                       (begin + timedelta(minutes=down)).isoformat(" ", timespec="minutes") if down else None,
-                       CAUSES[(s + h + m) % 3] if down else None)
-
-
-def init_db(db_path):
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(db_path, timeout=30)) as db, db:
-        db.execute("BEGIN IMMEDIATE")
-        version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version == 1:
-            return
-        if version:
-            raise RuntimeError(f"Неизвестная версия схемы SQLite: {version}.")
-        db.execute("""
-            CREATE TABLE production (
-                tick INTEGER NOT NULL, machine TEXT NOT NULL, shift_id INTEGER NOT NULL,
-                line TEXT NOT NULL, shift TEXT NOT NULL, status TEXT NOT NULL,
-                plan INTEGER NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL,
-                size_bad INTEGER NOT NULL, surface_bad INTEGER NOT NULL, shape_bad INTEGER NOT NULL,
-                down INTEGER NOT NULL, started_at TEXT, ended_at TEXT, reason TEXT,
-                PRIMARY KEY(tick, machine)
-            )
-        """)
-        db.executemany("INSERT INTO production VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", _seed_rows())
-        db.execute("CREATE INDEX production_shift ON production(shift_id,line,machine)")
-        db.execute("PRAGMA user_version=1")
-
-
-def _scope(db, q):
-    conditions, values = [], []
+def _scope_df(df, q):
     if q["since"] or q["until"]:
-        for key, operator, extra in (("since", ">=", 0), ("until", "<", 24)):
-            if q[key]:
-                midnight = datetime.combine(date.fromisoformat(q[key]), time.min)
-                tick = (midnight - START) // timedelta(hours=1)
-                conditions.append(f"tick {operator} ?")
-                values.append(tick + extra - 168 * q["offset"])
+        if q["since"]:
+            midnight = datetime.combine(date.fromisoformat(q["since"]), time.min)
+            tick_min = (midnight - START) // timedelta(hours=1) - 168 * q["offset"]
+            df = df[df["tick"] >= tick_min]
+        if q["until"]:
+            midnight = datetime.combine(date.fromisoformat(q["until"]), time.min)
+            tick_max = (midnight - START) // timedelta(hours=1) + 24 - 168 * q["offset"]
+            df = df[df["tick"] < tick_max]
     else:
-        last = db.execute("SELECT MAX(shift_id) FROM production").fetchone()[0]
-        end = (last if last is not None else -1) - 14 * q["offset"]
-        conditions.append("shift_id BETWEEN ? AND ?")
-        values.extend((end - q["count"] + 1, end))
+        last = int(df["shift_id"].max()) if not df.empty else -1
+        end = last - 14 * q["offset"]
+        df = df[(df["shift_id"] >= end - q["count"] + 1) & (df["shift_id"] <= end)]
     for key in ("line", "machine", "shift", "status"):
         if q[key] != ALL:
-            conditions.append(f"{key} = ?")
-            values.append(q[key])
-    db.execute("CREATE TEMP TABLE scope AS SELECT * FROM production WHERE " + " AND ".join(conditions), values)
+            df = df[df[key] == q[key]]
+    return df.copy()
 
 
-def _totals(defect, *, qualified="", down_threshold=None):
-    prefix = qualified
-    good, plan, bad, tick, down = (prefix + k for k in ("good", "plan", "bad", "tick", "down"))
-    selected = prefix + DEFECTS.get(defect, "bad")
-    down_term = down if down_threshold is None else f"CASE WHEN {down}>{down_threshold} THEN {down} ELSE 0 END"
-    return f"""
-        COALESCE(SUM({good}),0) AS good, COALESCE(SUM({plan}),0) AS plan,
-        COALESCE(SUM({selected}),0) AS bad, COALESCE(SUM({down_term}),0) AS down,
-        100.0*SUM({selected})/NULLIF(SUM({good}+{bad}),0) AS rate,
-        100.0*(COUNT({tick})*60-SUM({down}))/NULLIF(COUNT({tick})*60,0) AS load,
-        100.0*(SUM({good})-SUM({plan}))/NULLIF(SUM({plan}),0) AS deviation,
-        1.0*SUM({good})/NULLIF(COUNT(DISTINCT {tick}),0) AS average"""
+def _selected_defect(q):
+    return DEFECTS.get(q["defect"], "bad")
 
 
-GROUPS = {"shift": ("shift_id", "line"), "line": ("line",), "machine": ("machine",),
-          "hour": ("tick",), "period_shift": ("shift_id",), "events": ("machine",)}
+def _aggregate(df, q, dims, use_prior=False, for_events=False):
+    if df.empty:
+        cols = list(dims) + ["good", "plan", "bad", "down", "n", "distinct_ticks",
+                             "rate", "load", "deviation", "average"]
+        return pd.DataFrame(columns=cols)
+    defect_col = _selected_defect(q)
+    is_defect = defect_col in ("size_bad", "surface_bad", "shape_bad")
+    work = df.copy()
+    min_threshold = q["min"] if for_events else None
+    if use_prior:
+        work["g_good"] = work["p_good"]
+        work["g_plan"] = work["p_plan"]
+        work["g_bad"] = work[f"p_{defect_col}"] if is_defect else work["p_bad"]
+        work["g_down"] = work["p_down"]
+        if min_threshold is not None:
+            work["g_down"] = work["g_down"].where(work["g_down"] > min_threshold, 0)
+        work["g_tick"] = work["p_tick"]
+        work["_has_prior"] = work["p_good"].notna()
+        group_ok = work.groupby(list(dims))["_has_prior"].transform("all")
+        work = work[group_ok].copy()
+    else:
+        work["g_good"] = work["good"]
+        work["g_plan"] = work["plan"]
+        work["g_bad"] = work[defect_col] if is_defect else work["bad"]
+        work["g_down"] = work["down"]
+        if min_threshold is not None:
+            work["g_down"] = work["g_down"].where(work["g_down"] > min_threshold, 0)
+        work["g_tick"] = work["tick"]
+    agg = work.groupby(list(dims), dropna=False, as_index=False).agg(
+        good=("g_good", "sum"),
+        plan=("g_plan", "sum"),
+        bad=("g_bad", "sum"),
+        down=("g_down", "sum"),
+        n=("tick", "size"),
+        distinct_ticks=("g_tick", "nunique"),
+    )
+    agg["rate"] = np.where(agg["good"] + agg["bad"] > 0,
+                           100.0 * agg["bad"] / (agg["good"] + agg["bad"]), np.nan)
+    agg["load"] = np.where(agg["n"] > 0, 100.0 * (agg["n"] * 60 - agg["down"]) / (agg["n"] * 60), np.nan)
+    agg["deviation"] = np.where(agg["plan"] != 0, 100.0 * (agg["good"] - agg["plan"]) / agg["plan"], np.nan)
+    agg["average"] = np.where(agg["distinct_ticks"] > 0, agg["good"] / agg["distinct_ticks"], np.nan)
+    return agg
 
 
-def _restrict(db, q, dims, totals):
+def _restrict_df(df, q, dims):
     if not q["lag"] and not q["top"]:
-        return
-    cols = ", ".join(dims)
+        return df
+    g = _aggregate(df, q, dims)
     field = METRICS[q["metric"]][0]
-    having = "HAVING deviation < 0 AND deviation <= ?" if q["lag"] else ""
-    order = "deviation ASC" if q["lag"] else f"{field} DESC"
-    values = [-q["threshold"]] if q["lag"] else []
-    db.execute(f"""CREATE TEMP TABLE chosen AS SELECT {cols}, {totals}
-        FROM scope GROUP BY {cols} {having} ORDER BY {order}, {cols} LIMIT ?""",
-               [*values, q["top"] or -1])
-    match = " AND ".join(f"chosen.{col}=scope.{col}" for col in dims)
-    db.execute(f"DELETE FROM scope WHERE NOT EXISTS(SELECT 1 FROM chosen WHERE {match})")
-
-
-def _previous(db, q):
-    predicate = "AND p.status = ?" if q["status"] != ALL else ""
-    params = [q["status"]] if predicate else []
-    db.execute(f"""CREATE TEMP TABLE historical AS
-        SELECT s.tick, s.shift_id, s.line, s.machine, p.tick AS present,
-               p.good, p.plan, p.bad, p.size_bad, p.surface_bad, p.shape_bad, p.down
-        FROM scope AS s LEFT JOIN production AS p
-        ON p.tick=s.tick-168 AND p.machine=s.machine {predicate}""", params)
-
-
-def _groups(db, q, dims, *, previous=False, for_events=False):
-    cols = ", ".join(dims)
-    source = "historical" if previous else "scope"
-    totals = _totals(q["defect"], down_threshold=q["min"] if for_events else None)
-    sql = f"SELECT {cols}, {totals} FROM {source} GROUP BY {cols}"
-    if previous:
-        sql += " HAVING COUNT(present)=COUNT(*)"
-    return [dict(row) for row in db.execute(sql + f" ORDER BY {cols}")]
-
-
-def _stamp(tick):
-    return START + timedelta(hours=tick)
+    if q["lag"]:
+        g = g[g["deviation"].notna() & (g["deviation"] < 0) & (g["deviation"] <= -q["threshold"])]
+        g = g.sort_values("deviation", ascending=True)
+    else:
+        g = g.sort_values(field, ascending=False, na_position="last")
+    limit = q["top"] or -1
+    if limit >= 0:
+        g = g.head(limit)
+    if g.empty:
+        return df.iloc[0:0].copy()
+    keys = g[list(dims)]
+    return df.merge(keys, on=list(dims), how="inner")
 
 
 def _label(row, dims):
     if "tick" in dims:
-        return _stamp(row["tick"]).strftime("%d.%m %H:%M")
+        tick = row["tick"] if "tick" in row else row[dims[0]]
+        return (START + timedelta(hours=int(tick))).strftime("%d.%m %H:%M")
     if "shift_id" in dims:
-        s = row["shift_id"]
-        return _stamp(s * 12).strftime("%d.%m") + (" · ночь" if s % 2 else " · день")
+        s = int(row["shift_id"]) if "shift_id" in row else int(row[dims[0]])
+        return (START + timedelta(hours=s * 12)).strftime("%d.%m") + (" · ночь" if s % 2 else " · день")
     return row[dims[0]]
 
 
-def _series(db, q):
-    dims = GROUPS["hour" if q["grain"] == "hour" else "period_shift"]
+def _series(df, q):
+    dims = list(GROUPS["hour" if q["grain"] == "hour" else "period_shift"])
     field = METRICS[q["metric"]][0]
     events = q["basis"] == "downtime_events"
-    prior = {r[dims[0]]: r[field] for r in _groups(db, q, dims, previous=True, for_events=events)} if q["compare"] == "week" else {}
-    return [{"label": _label(r, dims), "actual": r[field],
-             "plan": r["plan"] if q["metric"] == "output" else None,
-             "previous": prior.get(r[dims[0]]), "downtime": r["down"]}
-            for r in _groups(db, q, dims, for_events=events)]
+    g = _aggregate(df, q, dims, for_events=events)
+    prior_map = {}
+    if q["compare"] == "week":
+        pg = _aggregate(df, q, dims, use_prior=True, for_events=events)
+        if not pg.empty:
+            pg["_key"] = pg.apply(lambda r: tuple(r[d] for d in dims), axis=1)
+            prior_map = dict(zip(pg["_key"], pg[field]))
+    out = []
+    for _, r in g.iterrows():
+        key = tuple(r[d] for d in dims)
+        out.append({
+            "label": _label(r.to_dict(), dims),
+            "actual": _clean(r[field]),
+            "plan": _clean(r["plan"]) if q["metric"] == "output" else None,
+            "previous": _clean(prior_map.get(key)),
+            "downtime": int(r["down"]) if not (isinstance(r["down"], float) and math.isnan(r["down"])) else 0,
+        })
+    return out
 
 
 def col(key, label, unit=""):
@@ -308,77 +374,125 @@ BASE_COLUMNS = (col("good", "Выпуск", "шт."), col("plan", "План", "�
                 col("rate", "Доля брака", "%"), col("down", "Простои", "мин"))
 
 
-def _metrics_table(db, q, dims):
+def _metrics_table(df, q, dims):
     field, label, unit = METRICS[q["metric"]]
     events = q["basis"] == "downtime_events"
-    rows = _groups(db, q, dims, for_events=events)
+    g = _aggregate(df, q, dims, for_events=events)
     if q["lag"]:
-        rows.sort(key=lambda r: r["deviation"])
-    elif q["top"] or dims == GROUPS["machine"]:
-        rows.sort(key=lambda r: r[field] if r[field] is not None else -math.inf, reverse=True)
+        g = g.sort_values("deviation", ascending=True)
+    elif q["top"] or dims == list(GROUPS["machine"]):
+        g = g.sort_values(field, ascending=False, na_position="last")
     elif "shift_id" in dims:
-        rows.sort(key=lambda r: -r["shift_id"])
+        g = g.sort_values("shift_id", ascending=False)
     labels = {"tick": "Час", "line": "Линия", "shift_id": "Смена", "machine": "Станок"}
     columns = [col(k, labels[k]) for k in dims] + list(BASE_COLUMNS)
     if field in ("average", "load"):
         columns.append(col(field, label, unit))
+    deltas = {}
     if "tick" in dims:
-        deltas = dict(db.execute(f"""WITH hourly AS (
-            SELECT tick, {_totals(q["defect"])} FROM scope GROUP BY tick
-        ), pairs AS (
-            SELECT tick, {field} AS value, LAG(tick) OVER w AS last_tick,
-                   LAG({field}) OVER w AS last_value FROM hourly WINDOW w AS (ORDER BY tick)
-        ) SELECT tick, CASE WHEN tick=last_tick+1 THEN value-last_value END FROM pairs"""))
-        for row in rows:
-            row["hour_change"] = deltas[row["tick"]]
-        columns.append(col("hour_change", "К прошлому часу", "п.п." if unit == "%" else unit))
+        hg = _aggregate(df, q, ["tick"], for_events=events)
+        hourly = dict(zip(hg["tick"], hg[field]))
+        sorted_ticks = sorted(hourly)
+        prev = None
+        for t in sorted_ticks:
+            if prev is not None and t == prev + 1:
+                deltas[t] = hourly[t] - hourly[prev]
+            else:
+                deltas[t] = None
+            prev = t
+    prior_map = {}
     if q["compare"] == "week":
-        keys = lambda row: tuple(row[d] for d in dims)
-        prior = {keys(r): r[field] for r in _groups(db, q, dims, previous=True, for_events=events)}
-        for row in rows:
-            old = prior.get(keys(row))
-            row["previous"] = old
-            row["difference"] = row[field] - old if old is not None and row[field] is not None else None
-        columns.extend([col("previous", "Неделей ранее", unit),
-                        col("difference", "Изменение", "п.п." if unit == "%" else unit)])
-    for row in rows:
+        pg = _aggregate(df, q, dims, use_prior=True, for_events=events)
+        if not pg.empty:
+            pg["_key"] = pg.apply(lambda r: tuple(r[d] for d in dims), axis=1)
+            prior_map = dict(zip(pg["_key"], pg[field]))
+    rows = []
+    for _, r in g.iterrows():
+        row = {d: _clean(r[d]) for d in dims}
+        row.update({
+            "good": _clean(r["good"]), "plan": _clean(r["plan"]), "bad": _clean(r["bad"]),
+            "deviation": _clean(r["deviation"]), "rate": _clean(r["rate"]),
+            "down": _clean(r["down"]),
+        })
+        if field in ("average", "load"):
+            row[field] = _clean(r[field])
+        if "tick" in dims:
+            row["hour_change"] = _clean(deltas.get(r["tick"]))
+        if q["compare"] == "week":
+            key = tuple(r[d] for d in dims)
+            old = prior_map.get(key)
+            row["previous"] = _clean(old)
+            if old is not None and not (isinstance(r[field], float) and math.isnan(r[field])):
+                row["difference"] = _clean(r[field] - old)
+            else:
+                row["difference"] = None
         if "tick" in dims or "shift_id" in dims:
             row[dims[0]] = _label(row, dims)
-    return {"columns": columns, "rows": [{c["key"]: row[c["key"]] for c in columns} for row in rows]}
+        rows.append(row)
+    if "tick" in dims:
+        columns = columns + [col("hour_change", "К прошлому часу", "п.п." if unit == "%" else unit)]
+    if q["compare"] == "week":
+        columns = columns + [col("previous", "Неделей ранее", unit),
+                            col("difference", "Изменение", "п.п." if unit == "%" else unit)]
+    return {"columns": columns, "rows": [{c["key"]: row.get(c["key"]) for c in columns} for row in rows]}
 
 
-def _defect_table(db, q):
+def _defect_table(df, q):
     columns = [col("reason", "Причина брака"), col("bad", "Брак", "шт."), col("rate", "Доля всего выпуска", "%")]
     weekly = q["compare"] == "week"
     if weekly:
-        columns.extend([col("previous", "Доля неделей ранее", "%"), col("difference", "Изменение", "п.п.")])
+        columns = columns + [col("previous", "Доля неделей ранее", "%"), col("difference", "Изменение", "п.п.")]
     rows = []
     for reason in DEFECTS:
         if q["defect"] not in (ALL, reason):
             continue
-        result = db.execute(f"SELECT {_totals(reason)} FROM scope HAVING COUNT(*)>0").fetchone()
-        if result is None:
-            continue
-        row = {"reason": reason, "bad": result["bad"], "rate": result["rate"]}
+        cname = DEFECTS[reason]
+        good = int(df["good"].sum()) if not df.empty else 0
+        bad = int(df[cname].sum()) if not df.empty else 0
+        rate = (100.0 * bad / (good + bad)) if (good + bad) else None
+        row = {"reason": reason, "bad": bad, "rate": _clean(rate)}
         if weekly:
-            prior = db.execute(f"SELECT {_totals(reason)} FROM historical HAVING COUNT(*)=COUNT(present) AND COUNT(*)>0").fetchone()
-            row["previous"] = prior["rate"] if prior else None
-            row["difference"] = row["rate"] - row["previous"] if row["rate"] is not None and row["previous"] is not None else None
+            if (not df.empty) and "has_prior" in df.columns and bool(df["has_prior"].all()):
+                p_good = int(df["p_good"].sum())
+                p_bad = int(df[f"p_{cname}"].sum())
+                p_rate = (100.0 * p_bad / (p_good + p_bad)) if (p_good + p_bad) else None
+            else:
+                p_rate = None
+            row["previous"] = _clean(p_rate)
+            row["difference"] = _clean(rate - p_rate) if (rate is not None and p_rate is not None) else None
         rows.append(row)
     rows.sort(key=lambda r: -r["bad"])
     return {"columns": columns, "rows": rows}
 
 
-def _events_table(db, q):
+def _events_table(df, q):
     columns = [col("started_at", "Начало"), col("ended_at", "Окончание"), col("line", "Линия"),
                col("machine", "Станок"), col("down", "Простой", "мин"), col("reason", "Причина"),
                col("rate", "Брак на линии за час", "%")]
-    bad = DEFECTS.get(q["defect"], "bad")
-    rows = db.execute(f"""WITH rates AS (
-        SELECT tick,line,100.0*SUM({bad})/NULLIF(SUM(good+bad),0) AS rate FROM scope GROUP BY tick,line
-        ) SELECT started_at, ended_at, s.line, machine, down, reason, rate FROM scope s
-        JOIN rates USING(tick,line) WHERE down>? ORDER BY down DESC,tick DESC,machine""", (q["min"],))
-    return {"columns": columns, "rows": [dict(row) for row in rows]}
+    defect_col = _selected_defect(q)
+    is_defect = defect_col in ("size_bad", "surface_bad", "shape_bad")
+    bad_col = defect_col if is_defect else "bad"
+    if not df.empty:
+        groups = df.groupby(["tick", "line"], as_index=False).agg(
+            good=("good", "sum"),
+            bad=(bad_col, "sum"),
+        )
+        groups["rate"] = np.where(groups["good"] + groups["bad"] > 0,
+                                 100.0 * groups["bad"] / (groups["good"] + groups["bad"]), np.nan)
+        rate_map = dict(zip(zip(groups["tick"], groups["line"]), groups["rate"]))
+    else:
+        rate_map = {}
+    sub = df[df["down"] > q["min"]].copy() if not df.empty else df
+    sub = sub.sort_values(["down", "tick", "machine"], ascending=[False, False, True])
+    rows = []
+    for _, r in sub.iterrows():
+        rows.append({
+            "started_at": r["started_at"], "ended_at": r["ended_at"],
+            "line": r["line"], "machine": r["machine"],
+            "down": _clean(r["down"]), "reason": r["reason"],
+            "rate": _clean(rate_map.get((r["tick"], r["line"]))),
+        })
+    return {"columns": columns, "rows": rows}
 
 
 def _number(value):
@@ -386,6 +500,8 @@ def _number(value):
         return "нет данных"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float) and math.isnan(value):
+        return "нет данных"
     return f"{value:.1f}".replace(".", ",")
 
 
@@ -405,16 +521,16 @@ def _facts(q, table, kpi, historical_kpi):
         field, label, unit = METRICS[q["metric"]]
         value = kpi[field]
         if basis == "downtime_events":
-            value = sum(row["down"] for row in rows)
+            value = sum(row["down"] for row in rows if row["down"] is not None)
         suffix = "" if unit.endswith(".") else "."
         fact = f"{label} за выбранный период: {_number(value)} {unit}{suffix}"
-        if not historical_kpi or historical_kpi[field] is None or value is None:
+        if not historical_kpi or historical_kpi.get(field) is None or value is None:
             comparison = "Недостаточно сопоставимых данных за предыдущую неделю."
         else:
             prior = historical_kpi[field]
             change_unit = "п.п." if unit == "%" else unit
             change_suffix = "" if change_unit.endswith(".") else "."
-            comparison = f"Неделей ранее: {_number(prior)} {unit}{suffix} Изменение: {_number(value-prior)} {change_unit}{change_suffix}"
+            comparison = f"Неделей ранее: {_number(prior)} {unit}{suffix} Изменение: {_number(value - prior)} {change_unit}{change_suffix}"
         return [fact, comparison], "Сверьте сменные задания и журнал событий за оба периода."
     if basis == "downtime_events":
         facts = [f"Событий в журнале: {len(rows)}.",
@@ -431,37 +547,92 @@ def _facts(q, table, kpi, historical_kpi):
         return facts, "Сопоставьте эти смены с журналом простоев и причинами брака."
     if basis in ("machine_ranking", "equipment_load"):
         key, label, unit = METRICS[q["metric"]]
-        top = max(rows, key=lambda r: -math.inf if r[key] is None else r[key])
+        top = max(rows, key=lambda r: float("-inf") if r[key] is None else r[key])
         group = ", ".join(str(top[k]) for k in ("shift_id", "line", "machine") if k in top)
         return [f"Максимум показателя «{label}»: {group}, {_number(top[key])} {unit}."], "Сопоставьте различия между группами с заданиями смены и журналом оборудования."
     return [f"Выпуск: {kpi['good']} при плане {kpi['plan']} шт. Отклонение: {_number(kpi['deviation'])} %.",
             f"Доля брака: {_number(kpi['rate'])} %. Простои: {kpi['down']} машино-минут. Средний выпуск за час: {_number(kpi['average'])} шт."], "Изучите часы с отклонениями и проверьте соответствующие записи журнала простоев."
 
 
+def _overall_kpi(df, q):
+    defect_col = _selected_defect(q)
+    is_defect = defect_col in ("size_bad", "surface_bad", "shape_bad")
+    if df.empty:
+        good = plan = bad = down = 0
+        n = distinct = 0
+    else:
+        good = int(df["good"].sum())
+        plan = int(df["plan"].sum())
+        bad = int(df[defect_col].sum()) if is_defect else int(df["bad"].sum())
+        down = int(df["down"].sum())
+        n = len(df)
+        distinct = int(df["tick"].nunique())
+    rate = (100.0 * bad / (good + bad)) if (good + bad) else None
+    load = (100.0 * (n * 60 - down) / (n * 60)) if n else None
+    deviation = (100.0 * (good - plan) / plan) if plan else None
+    average = (1.0 * good / distinct) if distinct else None
+    return {"good": good, "plan": plan, "bad": bad, "rate": rate, "down": down,
+            "load": load, "deviation": deviation, "average": average}
+
+
+def _overall_prior_kpi(df, q):
+    if df.empty or "has_prior" not in df.columns or not bool(df["has_prior"].all()):
+        return None
+    defect_col = _selected_defect(q)
+    is_defect = defect_col in ("size_bad", "surface_bad", "shape_bad")
+    good = int(df["p_good"].sum())
+    plan = int(df["p_plan"].sum())
+    bad = int(df[f"p_{defect_col}"].sum()) if is_defect else int(df["p_bad"].sum())
+    down = int(df["p_down"].sum())
+    n = len(df)
+    distinct = int(df["p_tick"].nunique())
+    field = METRICS[q["metric"]][0]
+    rate = (100.0 * bad / (good + bad)) if (good + bad) else None
+    load = (100.0 * (n * 60 - down) / (n * 60)) if n else None
+    deviation = (100.0 * (good - plan) / plan) if plan else None
+    average = (1.0 * good / distinct) if distinct else None
+    metric_map = {"good": good, "plan": plan, "bad": bad, "rate": rate, "down": down,
+                  "load": load, "deviation": deviation, "average": average}
+    result = {"good": good, "plan": plan, "bad": bad, "rate": rate, "down": down,
+              "load": load, "deviation": deviation, "average": average}
+    result[field] = metric_map.get(field, result.get(field))
+    return result
+
+
 def _analyze(db_path, name, arguments, previous_filters, **defaults):
     q = _resolve(name, {} if arguments is None else arguments, previous_filters, defaults)
     basis = q["basis"]
-    dims = GROUPS["hour" if basis == "hourly_output" else q["view"]]
-    with closing(sqlite3.connect(db_path, timeout=30)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("BEGIN")
-        _scope(db, q)
-        _restrict(db, q, dims, _totals(q["defect"]))
-        historical_kpi = None
-        if q["compare"] == "week":
-            _previous(db, q)
-            totals = _totals(q["defect"], down_threshold=q["min"] if basis == "downtime_events" else None)
-            historical_kpi = db.execute(f"""
-                SELECT {totals} FROM historical
-                HAVING COUNT(present)=COUNT(*) AND COUNT(*)>0""").fetchone()
-        kpi = dict(db.execute(f'SELECT {_totals(q["defect"])} FROM scope').fetchone())
-        if basis == "downtime_events" and q["compare"] != "week":
-            table = _events_table(db, q)
-        elif basis == "defect_breakdown":
-            table = _defect_table(db, q)
-        else:
-            table = _metrics_table(db, q, dims)
-        series = _series(db, q)
+    dims = list(GROUPS["hour" if basis == "hourly_output" else q["view"]])
+    df = _load_df(db_path)
+    scoped = _scope_df(df, q)
+    if q["compare"] == "week":
+        prior = df[["tick", "machine", "status", "good", "plan", "bad",
+                    "size_bad", "surface_bad", "shape_bad", "down"]].copy()
+        prior = prior.rename(columns={
+            "tick": "p_tick", "status": "p_status", "good": "p_good",
+            "plan": "p_plan", "bad": "p_bad", "size_bad": "p_size_bad",
+            "surface_bad": "p_surface_bad", "shape_bad": "p_shape_bad", "down": "p_down",
+        })
+        prior["tick"] = prior["p_tick"] + 168
+        scoped = scoped.merge(prior, on=["tick", "machine"], how="left")
+        if q["status"] != ALL:
+            mask = scoped["p_status"] == q["status"]
+            pcols = [c for c in scoped.columns if c.startswith("p_")]
+            scoped.loc[~mask, pcols] = np.nan
+        scoped["has_prior"] = scoped["p_good"].notna()
+    scoped = _restrict_df(scoped, q, dims)
+    kpi = _overall_kpi(scoped, q)
+    historical_kpi = None
+    if q["compare"] == "week":
+        if (not scoped.empty) and bool(scoped["has_prior"].all()):
+            historical_kpi = _overall_prior_kpi(scoped, q)
+    if basis == "downtime_events" and q["compare"] != "week":
+        table = _events_table(scoped, q)
+    elif basis == "defect_breakdown":
+        table = _defect_table(scoped, q)
+    else:
+        table = _metrics_table(scoped, q, dims)
+    series = _series(scoped, q)
     facts, recommendation = _facts(q, table, kpi, historical_kpi)
     _, label, unit = METRICS[q["metric"]]
     return {"filters": q, "table": table, "series": series,

@@ -21,7 +21,7 @@ compose.yaml
 docker compose up --build
 ```
 
-Откройте [http://localhost:8080/](http://localhost:8080/). Первый запуск создаёт учебную базу SQLite в томе `workshop-data`. Без ключа работает демонстрационный режим: вопрос разбирается правилами, расчёты идут через те же SQL-функции.
+Откройте [http://localhost:8080/](http://localhost:8080/). Первый запуск создаёт учебную базу SQLite в томе `workshop-data`. Без ключа работает только просмотр отчётов через `/api/report`; для чата нужен ключ OpenRouter/OpenAI.
 
 ### Подключение модели
 
@@ -64,7 +64,7 @@ docker compose up --build -d
 
 Swagger UI доступен по адресу `http://localhost:8080/docs`.
 
-Ответ содержит `tool`, `mode`, `model`, `filters`, `metric_label`, `unit`, `kpis`, `table`, `series`, `chart`, `facts`, `summary`, `recommendations`. Таблица — это `columns` с ключами, подписями и единицами плюс `rows`; ключи строк совпадают с ключами столбцов. График — PNG в base64.
+Ответ содержит `tool`, `mode`, `model`, `filters`, `metric_label`, `unit`, `kpis`, `table`, `series`, `facts`, `summary`, `recommendations`. Таблица — это `columns` с ключами, подписями и единицами плюс `rows`; ключи строк совпадают с ключами столбцов. `series` содержит точки для графика (факт, план, неделя назад, простои).
 
 ## Локальная разработка
 
@@ -100,5 +100,7 @@ SQLite хранит 2016 записей: 42 смены по 12 часов на �
 - Доля брака: `100 × брак / (годные детали + брак)`.
 - Загрузка: `100 × (доступные машино-минуты − простои) / доступные машино-минуты`.
 - Сравнение с прошлой неделей: те же станки и часы ровно на семь суток раньше.
+
+График строится на фронте по `series`; сервер рисунков не генерирует. Данные хранятся в SQLite, чтение и агрегация через pandas.
 
 Функции для function calling: `shift_summary`, `plan_shortfalls`, `hourly_output`, `machine_ranking`, `compare_week`, `downtime_events`, `defect_breakdown`, `equipment_load`.

@@ -1,6 +1,15 @@
 import json
+import logging
 import os
 from urllib.parse import urlsplit
+
+logger = logging.getLogger("takt.llm")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+DEBUG = os.getenv("LLM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 
@@ -98,29 +107,54 @@ def _json_object(raw, description):
 
 
 def _completion(client, common, messages, **options):
-    try:
-        result = client.chat.completions.create(messages=messages, **common, **options)
-    except APIStatusError as error:
-        status = error.status_code
-        if status in {401, 403}:
-            reason = "Проверьте ключ и доступ к выбранной модели."
-        elif status in {402, 429}:
-            reason = "Проверьте баланс и лимиты у провайдера."
-        elif status in {400, 404, 422}:
-            reason = "Проверьте адрес API, имя модели и поддержку tools и json_schema."
-        else:
-            reason = "Повторите запрос позднее."
-        raise ProviderError(f"Ошибка LLM-провайдера (HTTP {status}). {reason}") from error
-    except APIConnectionError as error:
-        raise ProviderError("Не удалось связаться с LLM-провайдером. Проверьте адрес API и сеть.") from error
-    except OpenAIError as error:
-        raise ProviderError("Клиент OpenAI не получил корректный ответ провайдера.") from error
-    if not result.choices:
-        raise ProviderError("LLM-провайдер вернул пустой ответ.")
-    choice = result.choices[0]
-    if choice.finish_reason in {"length", "content_filter"} or getattr(choice.message, "refusal", None):
-        raise ProviderError("Провайдер прервал формирование ответа. Попробуйте уточнить вопрос.")
-    return choice.message
+    candidates = [common]
+    if common.get("extra_body", {}).get("provider", {}).get("require_parameters"):
+        candidates.append({key: value for key, value in common.items() if key != "extra_body"})
+    last_error = None
+    logger.info("llm request: model=%s tools=%d options=%s candidates=%d",
+                common.get("model"), len(common.get("tools", [])), sorted(options), len(candidates))
+    if DEBUG:
+        logger.debug("messages=%s", json.dumps(messages, ensure_ascii=False)[:4000])
+    for candidate in candidates:
+        try:
+            result = client.chat.completions.create(messages=messages, **candidate, **options)
+        except APIStatusError as error:
+            last_error = error
+            logger.warning("llm http %s: %s", error.status_code, getattr(error, "body", None) or str(error)[:300])
+            if error.status_code == 404 and candidate is not candidates[-1]:
+                continue
+            last_error = error
+            if error.status_code == 404 and candidate is not candidates[-1]:
+                continue
+            status = error.status_code
+            if status in {401, 403}:
+                reason = "Проверьте ключ и доступ к выбранной модели."
+            elif status in {402, 429}:
+                reason = "Проверьте баланс и лимиты у провайдера."
+            elif status in {400, 404, 422}:
+                reason = "Проверьте адрес API, имя модели и поддержку tools и json_schema."
+            else:
+                reason = "Повторите запрос позднее."
+            raise ProviderError(f"Ошибка LLM-провайдера (HTTP {status}). {reason}") from error
+        except APIConnectionError as error:
+            raise ProviderError("Не удалось связаться с LLM-провайдером. Проверьте адрес API и сеть.") from error
+        except OpenAIError as error:
+            raise ProviderError("Клиент OpenAI не получил корректный ответ провайдера.") from error
+        if not result.choices:
+            logger.warning("llm empty choices")
+            raise ProviderError("LLM-провайдер вернул пустой ответ.")
+        choice = result.choices[0]
+        logger.info("llm response: finish=%s tool_calls=%d content=%r",
+                    choice.finish_reason,
+                    len(choice.message.tool_calls or []),
+                    (choice.message.content or "")[:120])
+        if choice.finish_reason in {"length", "content_filter"} or getattr(choice.message, "refusal", None):
+            raise ProviderError("Провайдер прервал формирование ответа. Попробуйте уточнить вопрос.")
+        return choice.message
+    if last_error is not None:
+        status = last_error.status_code
+        raise ProviderError(f"Ошибка LLM-провайдера (HTTP {status}). Проверьте адрес API, имя модели и поддержку tools и json_schema.") from last_error
+    raise ProviderError("LLM-провайдер вернул пустой ответ.")
 
 
 def _id_list(allowed, description):
@@ -155,6 +189,7 @@ def _analyze(client, db_path, question, context, model, router):
     call = calls[0]
     name = call.function.name
     args = _json_object(call.function.arguments, "аргументы функции")
+    logger.info("llm selected tool: %s args=%s", name, args)
     if name == "request_clarification":
         topic = args.get("topic")
         if set(args) != {"topic"} or not isinstance(topic, str) or topic not in CLARIFY:

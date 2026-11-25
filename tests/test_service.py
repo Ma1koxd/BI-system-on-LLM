@@ -34,6 +34,11 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text[:250])
         return r.json()
 
+    async def report(self, tool, arguments=None, context=None):
+        r = await self.http.post("/api/report", json={"tool": tool, "arguments": arguments or {}, "context": context or {}})
+        self.assertEqual(r.status_code, 200, r.text[:250])
+        return r.json()
+
     async def test_all_tools_produce_consistent_json_tables_and_png(self):
         for spec in analytics.TOOLS:
             name = spec["function"]["name"]
@@ -43,8 +48,7 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
                 result = r.json()
                 self.assertEqual(result["schema_version"], "1.0")
                 self.assertEqual(result["tool"], name)
-                self.assertEqual(result["chart"]["mime_type"], "image/png")
-                self.assertTrue(base64.b64decode(result["chart"]["data"], validate=True).startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertTrue(result["series"])
                 keys = {c["key"] for c in result["table"]["columns"]}
                 self.assertTrue(result["table"]["rows"])
                 self.assertTrue(all(set(row) == keys for row in result["table"]["rows"]))
@@ -52,25 +56,25 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.get("/api/config")).json(), {"mode": "demo", "model": ""})
 
     async def test_context_empty_selection_and_reset(self):
-        lag = await self.ask("Где выпуск сильно отстаёт от плана и какой там процент брака за последние 5 смен?")
+        lag = await self.report("plan_shortfalls", {"count": 5}, {})
         self.assertEqual([(r["good"], r["plan"]) for r in lag["table"]["rows"]], [(469, 720), (552, 720)])
-        night = await self.ask("Покажи только ночные смены", lag["filters"])
+        night = await self.report("plan_shortfalls", {"shift": "Ночь"}, lag["filters"])
         self.assertEqual(night["table"]["rows"], [])
-        full = await self.ask("Сбросить фильтры", night["filters"])
+        full = await self.report("shift_summary", {k: v for k, v in analytics.DEFAULT_FILTERS.items() if k not in {"tool", "basis"}}, night["filters"])
         self.assertEqual(full["kpis"]["good"], 6658)
-        weekly = await self.ask("Сравни с прошлой неделей", full["filters"])
+        weekly = await self.report("compare_week", {"compare": "week"}, full["filters"])
         self.assertTrue(all(r["previous"] is not None for r in weekly["table"]["rows"]))
-        window = await self.ask("Сравни с прошлой неделей за 42 смены")
+        window = await self.report("compare_week", {"count": 42, "compare": "week"}, full["filters"])
         self.assertTrue(any(r["previous"] is None for r in window["table"]["rows"]))
 
     async def test_threshold_hourly_delta_and_event_reason(self):
-        out = await self.ask("Покажи отставание от плана более 25,5 %")
+        out = await self.report("plan_shortfalls", {"threshold": 25.5}, {})
         self.assertEqual(len(out["table"]["rows"]), 1)
-        events = await self.ask("Покажи простои длиннее 30 минут с причиной")
+        events = await self.report("downtime_events", {"min": 30}, {})
         rows = events["table"]["rows"]
         self.assertEqual(len(rows), 9)
         self.assertTrue(all(r["down"] > 30 and r["reason"] for r in rows))
-        out = await self.ask("Выпуск по часам на линии А за 17.11.2026")
+        out = await self.report("hourly_output", {"line": "А", "since": "2026-11-17", "until": "2026-11-17", "grain": "hour"}, {})
         rows = out["table"]["rows"]
         self.assertEqual(len(rows), 24)
         self.assertIsNone(rows[0]["hour_change"])

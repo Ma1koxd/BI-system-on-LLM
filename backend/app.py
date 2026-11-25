@@ -11,8 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import analytics
 import llm
-from charts import chart_for
-from demo import parse_question
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT.parent / ".env")
@@ -69,16 +67,10 @@ class Point(BaseModel):
     downtime: int
 
 
-class Chart(BaseModel):
-    mime_type: Literal["image/png"]
-    data: str
-    alt: str
-
-
 class Report(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     tool: str
-    mode: Literal["direct", "demo", "llm"]
+    mode: Literal["direct", "llm"]
     model: str
     filters: dict[str, Cell]
     metric_label: str
@@ -86,7 +78,6 @@ class Report(BaseModel):
     kpis: KPI
     table: Table
     series: list[Point]
-    chart: Chart
     facts: list[str]
     summary: str
     recommendations: list[str]
@@ -139,7 +130,7 @@ def build_app(db_path=None):
                 "model": settings["model"] if settings["configured"] else ""}
 
     def finish(report):
-        return {**report, "tool": report["filters"]["tool"], "chart": chart_for(report)}
+        return {**report, "tool": report["filters"]["tool"]}
 
     @app.post("/api/report", response_model=Report)
     def manual(body: ToolRequest):
@@ -151,11 +142,7 @@ def build_app(db_path=None):
         if not question:
             raise ValueError("Введите вопрос.")
         context = analytics.validate_filters(body.context)
-        if llm.get_config()["configured"]:
-            report = llm.run_chat(db, question, context)
-        else:
-            tool, arguments = parse_question(question, context)
-            report = direct_report(db, tool, arguments, context, "demo")
+        report = llm.run_chat(db, question, context)
         return finish(report)
 
     return app
